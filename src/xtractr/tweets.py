@@ -22,7 +22,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .util import slugify
+from .util import sanitize_handle, slugify
 
 # ---------------------------------------------------------------------------
 # Defaults — overridable via CLI flags or library params
@@ -725,11 +725,12 @@ def export_tweet(row: sqlite3.Row, output_dir: Path) -> Path:
     if not slug:
         slug = row["id"]
 
-    filename = f"{date_str}-{row['author_handle']}-{slug}.md"
+    handle = sanitize_handle(row["author_handle"])
+    filename = f"{date_str}-{handle}-{slug}.md"
     path = output_dir / filename
 
     if path.exists():
-        path = output_dir / f"{date_str}-{row['author_handle']}-{row['id']}.md"
+        path = output_dir / f"{date_str}-{handle}-{row['id']}.md"
 
     media = json.loads(row["media_json"]) if row["media_json"] else []
     lang = row["lang"] or "en"

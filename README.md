@@ -219,3 +219,10 @@ If installed as a package, short CLI aliases are available:
 - **textual** — TUI framework for tweet selector
 - **rich** — terminal formatting
 - **deep-translator** — auto-translation of non-English tweets
+
+## Security notes
+
+xtractr is designed as a single-user local CLI tool. Keep these limitations in mind if you adapt it for other contexts:
+
+- **Plaintext cookie storage** — X session cookies (`auth_token`, `ct0`) are stored unencrypted in the SQLite database. The DB file is gitignored by default, but anyone with read access to it gets your X session. If the DB could be shared or synced, consider OS keychain integration instead.
+- **No URL filtering** — `clip` and `extract` will fetch any URL they're given, including internal/private IPs (e.g. `169.254.169.254`, `localhost`). This is fine when you're the one supplying URLs, but would be an SSRF risk if URLs came from untrusted input in a server context.
