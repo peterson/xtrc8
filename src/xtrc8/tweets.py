@@ -269,9 +269,28 @@ def _parse_tweet_from_graphql(entry: dict, now: str,
         media_list = []
         extended = legacy_tweet.get("extended_entities", {})
         for m in extended.get("media", []):
+            mtype = m.get("type", "photo")
+            thumb = m.get("media_url_https", m.get("media_url", ""))
+            # For videos and animated GIFs, the Twitter API puts the actual
+            # media stream in video_info.variants (list of {content_type,
+            # bitrate, url}). The media_url_https field is only the static
+            # preview thumbnail — downloading that produces a JPEG in a file
+            # named .mp4 (see xtrc8 issue #3). Pick the highest-bitrate mp4.
+            stream_url = None
+            if mtype in ("video", "animated_gif"):
+                variants = (m.get("video_info") or {}).get("variants", [])
+                mp4_variants = [
+                    v for v in variants
+                    if (v.get("content_type") or "").lower() == "video/mp4"
+                    and v.get("url")
+                ]
+                if mp4_variants:
+                    best = max(mp4_variants, key=lambda v: v.get("bitrate") or 0)
+                    stream_url = best["url"]
             media_list.append({
-                "type": m.get("type", "photo"),
-                "url": m.get("media_url_https", m.get("media_url", "")),
+                "type": mtype,
+                "url": stream_url or thumb,
+                "thumb_url": thumb if stream_url else None,
             })
 
         quote_url = None
@@ -693,16 +712,23 @@ def _translate_text(text: str, source_lang: str) -> str | None:
 
 def _download_media(url: str, tweet_id: str, index: int, media_dir: Path) -> Path | None:
     import httpx
+    from urllib.parse import urlparse
 
     media_dir.mkdir(parents=True, exist_ok=True)
 
-    ext = ".jpg"
-    if "video" in url or url.endswith(".mp4"):
+    # Infer extension from URL path (strip query string first — Twitter
+    # video CDN URLs often have ?tag=... on them).
+    url_path = urlparse(url).path.lower()
+    if url_path.endswith(".mp4") or "video.twimg.com" in url or "amplify_video" in url:
         ext = ".mp4"
-    elif url.endswith(".png"):
+    elif url_path.endswith(".png"):
         ext = ".png"
-    elif url.endswith(".gif"):
+    elif url_path.endswith(".gif"):
         ext = ".gif"
+    elif url_path.endswith(".webp"):
+        ext = ".webp"
+    else:
+        ext = ".jpg"
 
     local_name = f"{tweet_id}-{index}{ext}"
     local_path = media_dir / local_name
@@ -711,7 +737,7 @@ def _download_media(url: str, tweet_id: str, index: int, media_dir: Path) -> Pat
         return local_path
 
     try:
-        with httpx.Client(timeout=30, follow_redirects=True) as client:
+        with httpx.Client(timeout=60, follow_redirects=True) as client:
             resp = client.get(url)
             resp.raise_for_status()
             local_path.write_bytes(resp.content)
