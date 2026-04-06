@@ -41,8 +41,14 @@ BOOKMARKS_URL = f"{X_DOMAIN}/i/bookmarks"
 
 def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     db_path = db_path or _DEFAULT_DB
-    db = sqlite3.connect(db_path)
+    db = sqlite3.connect(db_path, timeout=10)
     db.row_factory = sqlite3.Row
+    # WAL mode: readers don't block writers and vice versa, better
+    # concurrency for TUI + background jobs. busy_timeout lets conflicting
+    # writers wait instead of failing immediately with "database is locked".
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=5000")
+    db.execute("PRAGMA synchronous=NORMAL")
     db.execute("""
         CREATE TABLE IF NOT EXISTS tweets (
             id TEXT PRIMARY KEY,
