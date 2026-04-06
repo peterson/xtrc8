@@ -15,6 +15,7 @@ dependencies = [
     "playwright>=1.40",
     "textual>=3.0",
     "deep-translator>=1.11.4",
+    "yt-dlp>=2024.12",
 ]
 
 [project.scripts]

@@ -299,6 +299,240 @@ def detect_arxiv(url: str) -> str | None:
     return None
 
 
+_VIDEO_HOSTS = (
+    "youtube.com", "youtu.be", "m.youtube.com",
+    "vimeo.com",
+    "twitch.tv", "clips.twitch.tv",
+    "dailymotion.com",
+    "soundcloud.com",
+    "rumble.com",
+    "odysee.com",
+    "peertube",
+)
+
+
+def detect_video_url(url: str) -> bool:
+    """Return True if url looks like a video host supported by yt-dlp."""
+    host = urlparse(url).netloc.lower().lstrip("www.")
+    return any(v in host for v in _VIDEO_HOSTS)
+
+
+def _format_captions_as_text(subtitle_path: Path) -> str:
+    """Convert an srt or vtt caption file to plain paragraph text,
+    stripping timestamps and sequence numbers. Preserves paragraph breaks
+    on blank-line boundaries."""
+    if not subtitle_path.exists():
+        return ""
+
+    raw = subtitle_path.read_text(encoding="utf-8", errors="replace")
+    lines: list[str] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        # Skip WEBVTT header
+        if s.startswith("WEBVTT") or s.startswith("NOTE") or s.startswith("Kind:") or s.startswith("Language:"):
+            continue
+        # Skip numeric sequence markers (srt)
+        if s.isdigit():
+            continue
+        # Skip timestamp lines: 00:00:00,000 --> 00:00:00,000
+        if "-->" in s:
+            continue
+        # Strip inline <c> tags and positioning metadata
+        s = re.sub(r"<[^>]+>", "", s)
+        s = re.sub(r"^\s*align:\S+\s*position:\S+\s*$", "", s)
+        if s.strip():
+            lines.append(s.strip())
+
+    # De-dupe consecutive identical lines (auto-captions often repeat)
+    deduped: list[str] = []
+    for line in lines:
+        if not deduped or deduped[-1] != line:
+            deduped.append(line)
+
+    text = "\n".join(deduped).strip()
+    # Collapse 3+ blank lines to single blank
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def clip_video(
+    url: str,
+    dest_dir: Path,
+    *,
+    download_video: bool = True,
+    max_height: int = 720,
+    keep_srt: bool = True,
+) -> Path:
+    """Clip a video from YouTube/Vimeo/Twitch/etc via yt-dlp.
+
+    Writes:
+      - {slug}.md         : markdown with metadata + full caption transcript
+      - {slug}.mp4        : the video (if download_video=True)
+      - {slug}.info.json  : full yt-dlp metadata dump
+      - {slug}.en.srt     : original subtitle file (if keep_srt=True)
+      - media/{slug}-thumb.{jpg,webp,png} : thumbnail image
+
+    Returns path to the markdown file.
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        print("ERROR: yt-dlp not installed. Run: uv add yt-dlp", file=sys.stderr)
+        sys.exit(1)
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    media_dir = dest_dir / "media"
+    media_dir.mkdir(exist_ok=True)
+
+    print(f"Fetching video metadata from {url}...")
+
+    # First pass: metadata-only to get title/id for slug
+    probe_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    with yt_dlp.YoutubeDL(probe_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=False)
+        except Exception as e:
+            print(f"ERROR: Could not fetch video info: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    title = info.get("title") or "untitled"
+    uploader = info.get("uploader") or info.get("channel") or "unknown"
+    video_id = info.get("id") or "unknown"
+    upload_date = info.get("upload_date")  # YYYYMMDD
+    if upload_date and len(upload_date) == 8:
+        date_str = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
+    else:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+
+    slug_base = slugify(title, max_len=40) or video_id
+    slug = f"{date_str}-{slugify(uploader, max_len=20)}-{slug_base}"
+    out_stem = dest_dir / slug
+
+    # Second pass: download video + subs + thumbnail + metadata
+    download_opts = {
+        "outtmpl": str(out_stem) + ".%(ext)s",
+        "writeinfojson": True,
+        "writethumbnail": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["en", "en-US", "en-GB"],
+        "subtitlesformat": "srt/vtt/best",
+        "quiet": False,
+        "no_warnings": True,
+        "merge_output_format": "mp4",
+    }
+    if download_video:
+        download_opts["format"] = f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={max_height}]/best"
+    else:
+        download_opts["skip_download"] = True
+
+    with yt_dlp.YoutubeDL(download_opts) as ydl:
+        try:
+            ydl.download([url])
+        except Exception as e:
+            print(f"WARN: Download phase had issues: {e}", file=sys.stderr)
+            # Continue — we may still have metadata and captions
+
+    # Locate downloaded artefacts
+    video_file = None
+    srt_file = None
+    thumb_file = None
+    info_json = None
+    for candidate in dest_dir.glob(f"{slug}.*"):
+        suf = candidate.suffix.lower()
+        name = candidate.name
+        if suf == ".mp4" and video_file is None:
+            video_file = candidate
+        elif suf in (".srt", ".vtt") and "en" in name.lower():
+            if srt_file is None or suf == ".srt":  # prefer srt
+                srt_file = candidate
+        elif suf in (".jpg", ".jpeg", ".png", ".webp") and thumb_file is None:
+            thumb_file = candidate
+        elif suf == ".json" and name.endswith(".info.json"):
+            info_json = candidate
+
+    # Move thumbnail to media/ subdir
+    if thumb_file is not None:
+        new_thumb = media_dir / f"{slug}-thumb{thumb_file.suffix}"
+        thumb_file.rename(new_thumb)
+        thumb_file = new_thumb
+
+    # Extract caption text
+    caption_text = ""
+    if srt_file:
+        caption_text = _format_captions_as_text(srt_file)
+        if not keep_srt:
+            srt_file.unlink(missing_ok=True)
+            srt_file = None
+
+    # Build markdown
+    description = (info.get("description") or "").strip()
+    duration = info.get("duration")
+    duration_str = ""
+    if duration:
+        h, rem = divmod(int(duration), 3600)
+        m, s = divmod(rem, 60)
+        duration_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    fm_lines = [
+        "---",
+        f"title: {title.replace(chr(10), ' ')}",
+        f"url: {url}",
+        f"channel: {uploader}",
+        f"date: {date_str}",
+        f"video_id: {video_id}",
+    ]
+    if duration_str:
+        fm_lines.append(f"duration: {duration_str}")
+    if video_file:
+        fm_lines.append(f"source_video: {video_file.name}")
+    if thumb_file:
+        fm_lines.append(f"thumbnail: media/{thumb_file.name}")
+    fm_lines.append("source: " + urlparse(url).netloc.replace("www.", ""))
+    fm_lines.append("---")
+
+    body_parts = [f"# {title}", ""]
+    if thumb_file:
+        body_parts.append(f"![{title}](media/{thumb_file.name})")
+        body_parts.append("")
+    body_parts.append(f"**Channel:** {uploader}  ")
+    body_parts.append(f"**Date:** {date_str}  ")
+    if duration_str:
+        body_parts.append(f"**Duration:** {duration_str}  ")
+    body_parts.append(f"**URL:** {url}  ")
+    body_parts.append("")
+    if description:
+        body_parts.append("## Description")
+        body_parts.append("")
+        body_parts.append(description)
+        body_parts.append("")
+    if caption_text:
+        body_parts.append("## Transcript")
+        body_parts.append("")
+        body_parts.append(caption_text)
+        body_parts.append("")
+    else:
+        body_parts.append("_No captions available for this video._")
+        body_parts.append("")
+
+    md_path = dest_dir / f"{slug}.md"
+    md_path.write_text("\n".join(fm_lines + [""] + body_parts))
+
+    print(f"  Video markdown: {md_path.name}")
+    if video_file:
+        print(f"  Video file:     {video_file.name}")
+    if thumb_file:
+        print(f"  Thumbnail:      media/{thumb_file.name}")
+    if info_json:
+        print(f"  Metadata JSON:  {info_json.name}")
+
+    return md_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Web/PDF content clipper")
     parser.add_argument("source", help="URL or file path to clip")
@@ -308,8 +542,16 @@ def main():
     )
     parser.add_argument(
         "--to", default=None,
-        choices=["refs", "papers", "datasheets", "misc"],
+        choices=["refs", "papers", "datasheets", "videos", "misc"],
         help="Subdirectory within output-dir (auto-detected if omitted)",
+    )
+    parser.add_argument(
+        "--no-video", action="store_true",
+        help="For video URLs: don't download the mp4, only metadata/captions/thumbnail",
+    )
+    parser.add_argument(
+        "--max-height", type=int, default=720,
+        help="Max video height to download (default: 720)",
     )
     args = parser.parse_args()
 
@@ -332,6 +574,13 @@ def main():
         elif source.lower().endswith(".pdf"):
             dest = base / (args.to or "papers")
             result = clip_pdf_url(source, dest)
+        elif detect_video_url(source):
+            dest = base / (args.to or "videos")
+            result = clip_video(
+                source, dest,
+                download_video=not args.no_video,
+                max_height=args.max_height,
+            )
         else:
             dest = base / (args.to or "refs")
             result = clip_web(source, dest)
