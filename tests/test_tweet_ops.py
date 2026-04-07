@@ -22,9 +22,13 @@ from xtrc8.tweets import (
     ImportResult,
     ReconcileResult,
     auto_ingest_folder,
+    compute_auto_staged_ids,
+    compute_imported_set,
+    compute_select_all_ids,
     export_tweet,
     get_db,
     import_tweets,
+    load_tweets_for_selection,
     purge_tweets,
     reconcile_with_disk,
     unimport_tweet,
@@ -451,3 +455,162 @@ def test_production_bug_scenario_does_not_recur(
     contents = "\n".join(f.read_text() for f in files)
     assert "1000000000000000000" not in contents
     assert "1000000000000000001" not in contents
+
+
+# ---------------------------------------------------------------------------
+# TUI data-layer helpers — these are the functions the TUI calls instead
+# of inlining SQL or selection logic. Locking the invariants here prevents
+# any future TUI code from regressing.
+# ---------------------------------------------------------------------------
+
+
+def test_load_tweets_for_selection_excludes_purged(
+    db: sqlite3.Connection
+):
+    """The fundamental TUI invariant: purged tweets do not appear in the
+    selector. Without this, the selector would auto-stage purged tweets
+    via _apply_folder_selections — which is the bug that motivated the
+    helper's creation."""
+    purge_tweets(db, ["1000000000000000000", "1000000000000000001"])
+    rows = load_tweets_for_selection(db)
+    assert len(rows) == 3
+    ids = {r["id"] for r in rows}
+    assert "1000000000000000000" not in ids
+    assert "1000000000000000001" not in ids
+
+
+def test_load_tweets_for_selection_sorted_newest_first(
+    db: sqlite3.Connection
+):
+    """Tweets must be sorted by created_at descending. The fixture uses
+    identical timestamps so order falls back to insertion order, but the
+    helper must not crash on parseable dates."""
+    rows = load_tweets_for_selection(db)
+    assert len(rows) == 5  # all 5 fixture rows present
+
+
+def test_compute_imported_set(db: sqlite3.Connection):
+    db.execute(
+        "UPDATE tweets SET ingested = 1 WHERE id IN (?, ?)",
+        ("1000000000000000000", "1000000000000000001"),
+    )
+    db.commit()
+    rows = load_tweets_for_selection(db)
+    imported = compute_imported_set(rows)
+    assert imported == {"1000000000000000000", "1000000000000000001"}
+
+
+def test_compute_auto_staged_ids_basic(db: sqlite3.Connection):
+    """Auto-staging picks up not-imported tweets in selected folders."""
+    rows = load_tweets_for_selection(db)
+    staged = compute_auto_staged_ids(rows, set(), {"Test"})
+    assert len(staged) == 5  # all 5 fixture tweets are in folder "Test"
+
+
+def test_compute_auto_staged_ids_excludes_imported(
+    db: sqlite3.Connection
+):
+    db.execute(
+        "UPDATE tweets SET ingested = 1 WHERE id = ?",
+        ("1000000000000000000",),
+    )
+    db.commit()
+    rows = load_tweets_for_selection(db)
+    imported = compute_imported_set(rows)
+    staged = compute_auto_staged_ids(rows, imported, {"Test"})
+    assert len(staged) == 4
+    assert "1000000000000000000" not in staged
+
+
+def test_compute_auto_staged_ids_excludes_purged_defence_in_depth(
+    db: sqlite3.Connection
+):
+    """Even if a purged tweet sneaks into tweet_rows (it shouldn't,
+    because load_tweets_for_selection filters it), the auto-stager must
+    still skip it. This is the defence-in-depth check that protected
+    against the production bug."""
+    # Build a synthetic tweet_rows that includes a purged row
+    rows = [
+        {"id": "1", "folder_name": "Test", "ingested": 0, "purged": None},
+        {"id": "2", "folder_name": "Test", "ingested": 0, "purged": "2026-04-07T00:00:00"},
+        {"id": "3", "folder_name": "Test", "ingested": 0, "purged": None},
+    ]
+    staged = compute_auto_staged_ids(rows, set(), {"Test"})
+    assert staged == {"1", "3"}
+
+
+def test_compute_auto_staged_ids_only_target_folders(
+    db: sqlite3.Connection
+):
+    upsert_tweet(db, _make_tweet("2000000000000000000", folder_name="Other"))
+    db.commit()
+    rows = load_tweets_for_selection(db)
+    # Only 'Test' is auto-ingest
+    staged = compute_auto_staged_ids(rows, set(), {"Test"})
+    assert "2000000000000000000" not in staged
+    assert len(staged) == 5
+
+
+def test_compute_select_all_ids_excludes_imported_and_purged(
+    db: sqlite3.Connection
+):
+    """select-all in the tweets pane must skip both imported and purged.
+    This is the bug at line 1719 that motivated extracting this helper:
+    the original `self.selected = {t["id"] for t in self.tweet_rows}`
+    selected EVERYTHING with no filtering.
+    """
+    db.execute(
+        "UPDATE tweets SET ingested = 1 WHERE id = ?",
+        ("1000000000000000000",),
+    )
+    purge_tweets(db, ["1000000000000000001"])
+    db.commit()
+
+    rows = load_tweets_for_selection(db)
+    imported = compute_imported_set(rows)
+    select_all = compute_select_all_ids(rows, imported)
+
+    # 1000000000000000000 is imported → excluded
+    # 1000000000000000001 is purged → not even in rows
+    # 1000000000000000002, 3, 4 → included
+    assert "1000000000000000000" not in select_all
+    assert "1000000000000000001" not in select_all
+    assert select_all == {
+        "1000000000000000002",
+        "1000000000000000003",
+        "1000000000000000004",
+    }
+
+
+def test_no_raw_tweet_sql_in_tui_codepath():
+    """Static check: scan _build_tui for the exact dangler pattern
+    `SELECT * FROM tweets`. This is the wildcard-load query that bypasses
+    load_tweets_for_selection() and reintroduces the production bug.
+
+    Allowed inside _build_tui (these queries do not load tweet rows for
+    display, they compute folder counts or upsert folders):
+    - SELECT name, folder_id FROM folders
+    - SELECT name, COALESCE(...) ... FROM folders
+    - SELECT COUNT(*) FROM tweets WHERE folder_name IS NULL
+    - SELECT COALESCE(folder_name, '(unfiled)'), COUNT(*) FROM tweets ...
+
+    Forbidden:
+    - SELECT * FROM tweets ...   (use load_tweets_for_selection instead)
+    """
+    import inspect
+    import re
+
+    from xtrc8 import tweets as tweets_module
+
+    src = inspect.getsource(tweets_module._build_tui)
+
+    forbidden = re.findall(
+        r"SELECT\s+\*\s+FROM\s+tweets",
+        src,
+        flags=re.IGNORECASE,
+    )
+    assert not forbidden, (
+        f"Dangler in _build_tui: raw 'SELECT * FROM tweets' query found. "
+        f"All tweet loading MUST go through load_tweets_for_selection(). "
+        f"Offending matches: {forbidden}"
+    )

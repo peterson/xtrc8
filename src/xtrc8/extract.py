@@ -122,10 +122,13 @@ def clip_gist(url: str, dest_dir: Path) -> Path | None:
 
 
 def _fetch_author_replies(db, auth_db_path: Path | None = None) -> int:
+    # Exclude purged tweets — they are deleted from the consumer's perspective
+    # and must not have their reply chains re-scraped.
     rows = db.execute("""
         SELECT t.id, t.url, t.author_handle
         FROM tweets t
         WHERE t.ingested = 1
+        AND t.purged IS NULL
         AND t.id NOT IN (SELECT tweet_id FROM reply_scraped)
     """).fetchall()
 
@@ -288,10 +291,12 @@ def run_extract(db_path: Path, dry_run: bool = False, skip_replies: bool = False
     if not dry_run and not skip_replies:
         _fetch_author_replies(db, auth_db_path)
 
-    # Get all imported tweets with t.co links
+    # Get all imported (and not-purged) tweets with t.co links. Purged tweets
+    # are deleted from the consumer's perspective; their links must not be
+    # re-resolved or re-clipped.
     rows = db.execute("""
         SELECT id, full_text, author_handle
-        FROM tweets WHERE ingested = 1
+        FROM tweets WHERE ingested = 1 AND purged IS NULL
     """).fetchall()
 
     to_resolve = []

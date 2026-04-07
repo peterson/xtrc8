@@ -1181,6 +1181,95 @@ def auto_ingest_folder(
 
 
 # ---------------------------------------------------------------------------
+# TUI data-layer helpers — pure, testable functions used by the Textual
+# selector app. Centralising these here is what prevents the TUI from
+# bypassing the purged / ingested invariants. Any future TUI code that
+# needs to load tweet rows or compute selection state MUST go through
+# these helpers — do not write fresh SQL inside the TUI class.
+# ---------------------------------------------------------------------------
+
+
+def load_tweets_for_selection(db: sqlite3.Connection) -> list[dict]:
+    """Return the list of tweet dicts the TUI should display in its selector.
+
+    Excludes purged tweets unconditionally — they are deleted from the
+    consumer's perspective and must never appear in the selector (showing
+    them would let auto-staging or accidental selection re-import them).
+
+    Sorted newest first by created_at. Falls back to epoch for unparseable
+    dates so they sort to the bottom.
+    """
+    rows = db.execute(
+        "SELECT * FROM tweets WHERE purged IS NULL"
+    ).fetchall()
+    rows = [dict(r) for r in rows]
+
+    def _parse_date(t):
+        try:
+            return datetime.strptime(t["created_at"], "%a %b %d %H:%M:%S %z %Y")
+        except (ValueError, TypeError):
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    rows.sort(key=_parse_date, reverse=True)
+    return rows
+
+
+def compute_imported_set(tweet_rows: list[dict]) -> set[str]:
+    """Compute the set of imported tweet IDs from a tweet_rows list.
+
+    `imported` means "ingested = 1 AND not purged". Since
+    load_tweets_for_selection already excludes purged tweets, this is
+    just `ingested = 1` over the visible rows.
+    """
+    return {t["id"] for t in tweet_rows if t.get("ingested")}
+
+
+def compute_auto_staged_ids(
+    tweet_rows: list[dict],
+    imported_ids: set[str],
+    auto_folder_names: set[str],
+) -> set[str]:
+    """Compute which tweet IDs should be auto-staged for the next import.
+
+    A tweet is auto-staged if:
+    - its folder is in auto_folder_names, AND
+    - it is not already imported, AND
+    - it is not purged (defence-in-depth — should not appear in tweet_rows
+      anyway, since load_tweets_for_selection filters them).
+
+    Pure function. No DB access. Used by the TUI's _apply_folder_selections.
+    """
+    staged: set[str] = set()
+    for t in tweet_rows:
+        if t["id"] in imported_ids:
+            continue
+        if t.get("purged") is not None:
+            continue
+        fname = t.get("folder_name") or "(unfiled)"
+        if fname in auto_folder_names:
+            staged.add(t["id"])
+    return staged
+
+
+def compute_select_all_ids(
+    tweet_rows: list[dict],
+    imported_ids: set[str],
+) -> set[str]:
+    """Compute the set of tweet IDs for the TUI's tweets-pane "select all".
+
+    Excludes already-imported tweets (selecting them is meaningless — they
+    would just be filtered out at import time) and purged tweets (defence-
+    in-depth, same reason as compute_auto_staged_ids).
+
+    Pure function. No DB access.
+    """
+    return {
+        t["id"] for t in tweet_rows
+        if t["id"] not in imported_ids and t.get("purged") is None
+    }
+
+
+# ---------------------------------------------------------------------------
 # TUI selector
 # ---------------------------------------------------------------------------
 
@@ -1329,18 +1418,13 @@ def _build_tui(db_path: Path, output_dir: Path):
 
         def _load_data(self):
             db = get_db(self._db_path)
-            rows = db.execute("SELECT * FROM tweets").fetchall()
-            self.tweet_rows = [dict(r) for r in rows]
-
-            def _parse_date(t):
-                try:
-                    return datetime.strptime(t["created_at"], "%a %b %d %H:%M:%S %z %Y")
-                except (ValueError, TypeError):
-                    return datetime.min.replace(tzinfo=timezone.utc)
-
-            self.tweet_rows.sort(key=_parse_date, reverse=True)
+            # CANONICAL load path: load_tweets_for_selection() is the only
+            # way the TUI fetches tweet rows. It excludes purged tweets and
+            # sorts newest first. Do NOT replace this with raw SQL — see
+            # the docstring on load_tweets_for_selection for why.
+            self.tweet_rows = load_tweets_for_selection(db)
             self.visible_rows = list(self.tweet_rows)
-            self.imported = {t["id"] for t in self.tweet_rows if t["ingested"]}
+            self.imported = compute_imported_set(self.tweet_rows)
 
             all_folders = db.execute("""
                 SELECT f.name, f.folder_id, f.auto_ingest,
@@ -1544,17 +1628,9 @@ def _build_tui(db_path: Path, output_dir: Path):
 
         def _reload_tweet_data(self):
             db = get_db(self._db_path)
-            rows = db.execute("SELECT * FROM tweets").fetchall()
-            self.tweet_rows = [dict(r) for r in rows]
-
-            def _parse_date(t):
-                try:
-                    return datetime.strptime(t["created_at"], "%a %b %d %H:%M:%S %z %Y")
-                except (ValueError, TypeError):
-                    return datetime.min.replace(tzinfo=timezone.utc)
-
-            self.tweet_rows.sort(key=_parse_date, reverse=True)
-            self.imported = {t["id"] for t in self.tweet_rows if t["ingested"]}
+            # Same canonical path as _load_data — see comment there.
+            self.tweet_rows = load_tweets_for_selection(db)
+            self.imported = compute_imported_set(self.tweet_rows)
             db.close()
 
         def _on_bg_sync_complete(self, new_count: int):
@@ -1629,13 +1705,12 @@ def _build_tui(db_path: Path, output_dir: Path):
             self._update_status()
 
         def _apply_folder_selections(self):
-            self.selected.clear()
-            for t in self.tweet_rows:
-                if t["id"] in self.imported:
-                    continue
-                fname = t.get("folder_name") or "(unfiled)"
-                if fname in self.auto_folders:
-                    self.selected.add(t["id"])
+            # CANONICAL auto-stage path: compute_auto_staged_ids() is the
+            # only place that decides which tweets get auto-staged. Pure
+            # function, unit-tested. Do NOT inline new staging logic here.
+            self.selected = compute_auto_staged_ids(
+                self.tweet_rows, self.imported, self.auto_folders,
+            )
 
         def on_descendant_focus(self, event):
             widget = event.widget
@@ -1705,7 +1780,12 @@ def _build_tui(db_path: Path, output_dir: Path):
                 self._apply_folder_selections()
                 self._refresh_tweet_marks()
             else:
-                self.selected = {t["id"] for t in self.tweet_rows}
+                # CANONICAL select-all path: compute_select_all_ids() is the
+                # only place that decides what "select all visible tweets"
+                # means. It excludes already-imported and purged tweets.
+                self.selected = compute_select_all_ids(
+                    self.tweet_rows, self.imported,
+                )
                 self._refresh_tweet_marks()
             self._update_status()
 
